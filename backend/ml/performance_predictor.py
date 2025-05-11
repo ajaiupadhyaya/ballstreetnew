@@ -14,22 +14,42 @@ class PerformancePredictor:
         )
         self.scaler = StandardScaler()
         
-    def prepare_features(self, stats: Dict) -> np.ndarray:
-        """Prepare features for the model"""
-        features = [
-            stats.get('PTS', 0),
-            stats.get('REB', 0),
-            stats.get('AST', 0),
-            stats.get('STL', 0),
-            stats.get('BLK', 0),
-            stats.get('TOV', 0),
-            stats.get('FG_PCT', 0),
-            stats.get('FG3_PCT', 0),
-            stats.get('FT_PCT', 0),
-            stats.get('MIN', 0),
-            stats.get('PLUS_MINUS', 0)
-        ]
-        return np.array(features).reshape(1, -1)
+    def predict_performance(self, current_stats: Dict) -> float:
+    """Predict next game performance with better error handling"""
+    try:
+        features = self.prepare_features(current_stats)
+        
+        # Check if model is trained properly
+        if not hasattr(self.model, 'feature_importances_'):
+            # Model not properly trained, return weighted sum of stats instead
+            pts_weight = 1.0
+            reb_weight = 1.2
+            ast_weight = 1.5
+            stl_weight = 2.0
+            blk_weight = 2.0
+            
+            weighted_sum = (
+                current_stats.get('PTS', 0) * pts_weight +
+                current_stats.get('REB', 0) * reb_weight +
+                current_stats.get('AST', 0) * ast_weight +
+                current_stats.get('STL', 0) * stl_weight +
+                current_stats.get('BLK', 0) * blk_weight
+            )
+            return weighted_sum
+        
+        # Model is trained, use it for prediction
+        features = self.scaler.transform(features)
+        return float(self.model.predict(features)[0])
+    except Exception as e:
+        print(f"Error predicting performance: {e}")
+        # Return average of key stats as fallback
+        return sum([
+            current_stats.get('PTS', 0),
+            current_stats.get('REB', 0) * 1.2,
+            current_stats.get('AST', 0) * 1.5,
+            current_stats.get('STL', 0) * 2.0,
+            current_stats.get('BLK', 0) * 2.0
+        ])
         
     def train(self, historical_data: List[Dict]):
         """Train the model on historical performance data"""

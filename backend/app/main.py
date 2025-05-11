@@ -1,5 +1,6 @@
 # main.py
-
+import asyncio
+from fastapi import WebSocketDisconnect
 from fastapi import FastAPI, Depends, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -19,6 +20,28 @@ from models import User, Player, Portfolio, Transaction
 from ml.price_predictor import PricePredictor
 from ml.sentiment_analyzer import SentimentAnalyzer
 from ml.performance_predictor import PerformancePredictor
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except WebSocketDisconnect:
+                #client may have disconnected
+                pass
+
+manager = ConnectionManager()
 
 # Create database tables
 models.Base.metadata.create_all(bind=engine)
@@ -128,19 +151,65 @@ def execute_trade(
     
     total_amount = shares * player.current_price
     
+    # Get or create portfolio entry
+    portfolio = db.query(Portfolio).filter(
+        Portfolio.user_id == user_id,
+        Portfolio.player_id == player_id
+    ).first()
+    
     if transaction_type == "BUY":
         if user.balance < total_amount:
             raise HTTPException(status_code=400, detail="Insufficient funds")
-        user.balance -= total_amount
-    else:  # SELL
-        portfolio = db.query(Portfolio).filter(
-            Portfolio.user_id == user_id,
-            Portfolio.player_id == player_id
-        ).first()
         
+        user.balance -= total_amount
+        
+        # Update portfolio
+        if portfolio:
+            # Calculate new average price
+            new_total_shares = portfolio.shares + shares
+            new_avg_price = ((portfolio.shares * portfolio.average_buy_price) + (shares * player.current_price)) / new_total_shares
+            
+            portfolio.shares = new_total_shares
+            portfolio.average_buy_price = new_avg_price
+            portfolio.last_updated = datetime.utcnow()
+        else:
+            # Create new portfolio entry
+            portfolio = Portfolio(
+                user_id=user_id,
+                player_id=player_id,
+                shares=shares,
+                average_buy_price=player.current_price,
+                last_updated=datetime.utcnow()
+            )
+            db.add(portfolio)
+    else:  # SELL
         if not portfolio or portfolio.shares < shares:
             raise HTTPException(status_code=400, detail="Insufficient shares")
+        
         user.balance += total_amount
+        
+        # Update portfolio
+        portfolio.shares -= shares
+        portfolio.last_updated = datetime.utcnow()
+        
+        # Remove portfolio entry if no shares left
+        if portfolio.shares <= 0:
+            db.delete(portfolio)
+    
+    # Create transaction record
+    transaction = Transaction(
+        user_id=user_id,
+        player_id=player_id,
+        transaction_type=transaction_type,
+        shares=shares,
+        price_per_share=player.current_price,
+        total_amount=total_amount
+    )
+    
+    db.add(transaction)
+    db.commit()
+    
+    return {"message": "Trade executed successfully"}
     
     # Create transaction record
     transaction = Transaction(
@@ -160,7 +229,7 @@ def execute_trade(
 # WebSocket for real-time price updates
 @app.websocket("/ws/prices")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+    await manager.connect(websocket)
     try:
         while True:
             # Get latest prices for all players
@@ -169,31 +238,92 @@ async def websocket_endpoint(websocket: WebSocket):
             prices = {player.name: player.current_price for player in players}
             await websocket.send_json(prices)
             await asyncio.sleep(1)  # Update every second
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
     except Exception as e:
         print(f"WebSocket error: {e}")
-    finally:
-        await websocket.close()
+        manager.disconnect(websocket)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(update_market_prices())
+
+async def update_market_prices():
+    """Background task to update player prices"""
+    while True:
+        try:
+            # Update prices in database
+            db = next(get_db())
+            players = db.query(Player).all()
+            
+            price_updates = {}
+            for player in players:
+                # Random price fluctuation (replace with your actual price model later)
+                change_pct = np.random.normal(0, 0.01)  # Normal distribution with 1% std dev
+                new_price = player.current_price * (1 + change_pct)
+                
+                # Update price history
+                if not isinstance(player.price_history, list):
+                    player.price_history = []
+                player.price_history.append(player.current_price)
+                
+                # Keep only last 30 days of history
+                if len(player.price_history) > 30:
+                    player.price_history = player.price_history[-30:]
+                
+                player.current_price = new_price
+                price_updates[player.name] = new_price
+            
+            db.commit()
+            
+            # Broadcast price updates to all connected clients
+            await manager.broadcast(price_updates)
+            
+        except Exception as e:
+            print(f"Error updating market prices: {e}")
+        
+        # Update prices every minute
+        await asyncio.sleep(60)
 
 # Market analysis endpoints
 @app.get("/market/trending")
-def get_trending_players(db: Session = Depends(get_db)):
-    players = db.query(Player).all()
-    trending = sorted(
-        players,
-        key=lambda p: p.price_history[-1] - p.price_history[-2] if len(p.price_history) > 1 else 0,
-        reverse=True
-    )[:5]
-    return trending
+def get_trending_players(limit: int = 5, db: Session = Depends(get_db)):
+    try:
+        players = db.query(Player).all()
+        
+        # Make sure each player has at least 2 price points
+        valid_players = [
+            p for p in players 
+            if isinstance(p.price_history, list) and len(p.price_history) >= 2
+        ]
+        
+        if not valid_players:
+            return []
+        
+        # Calculate price changes
+        trending = []
+        for player in valid_players:
+            price_change = 0
+            if len(player.price_history) >= 2:
+                price_change = player.current_price - player.price_history[-2]
+                price_change_pct = price_change / player.price_history[-2] * 100
+                
+                trending.append({
+                    "id": player.id,
+                    "name": player.name,
+                    "current_price": player.current_price,
+                    "price_change": price_change,
+                    "price_change_pct": price_change_pct
+                })
+        
+        # Sort by percentage change
+        trending.sort(key=lambda p: p["price_change_pct"], reverse=True)
+        
+        return trending[:limit]
+    except Exception as e:
+        print(f"Error getting trending players: {e}")
+        raise HTTPException(status_code=500, detail="Error calculating trending players")
 
-@app.get("/market/volatile")
-def get_volatile_players(db: Session = Depends(get_db)):
-    players = db.query(Player).all()
-    volatile = sorted(
-        players,
-        key=lambda p: np.std(p.price_history[-10:]) if len(p.price_history) > 10 else 0,
-        reverse=True
-    )[:5]
-    return volatile
 
 # AI/ML endpoints
 @app.get("/player/{player_id}/predictions")
