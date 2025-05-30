@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import json
 from datetime import datetime, timedelta
+import logging
 
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import playergamelog, commonplayerinfo
@@ -20,6 +21,17 @@ from models import User, Player, Portfolio, Transaction
 from ml.price_predictor import PricePredictor
 from ml.sentiment_analyzer import SentimentAnalyzer
 from ml.performance_predictor import PerformancePredictor
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class ConnectionManager:
     def __init__(self):
@@ -86,19 +98,34 @@ sentiment_analyzer = SentimentAnalyzer()
 performance_predictor = PerformancePredictor()
 
 # Player endpoints
-@app.get("/players")
+@app.get("/players", response_model=List[Player], tags=["Players"])
 def get_players(db: Session = Depends(get_db)):
+    """
+    Get a list of all players in the system.
+    """
     return db.query(Player).all()
 
-@app.get("/player/{player_id}")
+@app.get("/player/{player_id}", response_model=Player, tags=["Players"])
 def get_player(player_id: int, db: Session = Depends(get_db)):
+    """
+    Get detailed information about a specific player.
+    
+    Args:
+        player_id: The ID of the player to retrieve
+    """
     player = db.query(Player).filter(Player.id == player_id).first()
     if not player:
         raise HTTPException(status_code=404, detail="Player not found")
     return player
 
-@app.get("/player/{player_id}/stats")
+@app.get("/player/{player_id}/stats", tags=["Players"])
 def get_player_stats(player_id: int, db: Session = Depends(get_db)):
+    """
+    Get detailed statistics for a specific player.
+    
+    Args:
+        player_id: The ID of the player to get stats for
+    """
     player = db.query(Player).filter(Player.id == player_id).first()
     if not player:
         raise HTTPException(status_code=404, detail="Player not found")
@@ -135,7 +162,7 @@ def get_portfolio(user_id: int, db: Session = Depends(get_db)):
     portfolio = db.query(Portfolio).filter(Portfolio.user_id == user_id).all()
     return portfolio
 
-@app.post("/trade")
+@app.post("/trade", tags=["Trading"])
 def execute_trade(
     user_id: int,
     player_id: int,
@@ -143,6 +170,21 @@ def execute_trade(
     shares: float,
     db: Session = Depends(get_db)
 ):
+    """
+    Execute a trade (buy/sell) for a player.
+    
+    Args:
+        user_id: The ID of the user making the trade
+        player_id: The ID of the player being traded
+        transaction_type: Either "BUY" or "SELL"
+        shares: Number of shares to trade
+    """
+    if transaction_type not in ["BUY", "SELL"]:
+        raise HTTPException(status_code=400, detail="Transaction type must be either 'BUY' or 'SELL'")
+    
+    if shares <= 0:
+        raise HTTPException(status_code=400, detail="Number of shares must be greater than 0")
+    
     user = db.query(User).filter(User.id == user_id).first()
     player = db.query(Player).filter(Player.id == player_id).first()
     
@@ -210,21 +252,6 @@ def execute_trade(
     db.commit()
     
     return {"message": "Trade executed successfully"}
-    
-    # Create transaction record
-    transaction = Transaction(
-        user_id=user_id,
-        player_id=player_id,
-        transaction_type=transaction_type,
-        shares=shares,
-        price_per_share=player.current_price,
-        total_amount=total_amount
-    )
-    
-    db.add(transaction)
-    db.commit()
-    
-    return {"message": "Trade executed successfully"}
 
 # WebSocket for real-time price updates
 @app.websocket("/ws/prices")
@@ -232,12 +259,17 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Get latest prices for all players
-            db = next(get_db())
-            players = db.query(Player).all()
-            prices = {player.name: player.current_price for player in players}
-            await websocket.send_json(prices)
-            await asyncio.sleep(1)  # Update every second
+            try:
+                # Get latest prices for all players
+                db = next(get_db())
+                players = db.query(Player).all()
+                prices = {player.name: player.current_price for player in players}
+                await websocket.send_json(prices)
+                await asyncio.sleep(1)  # Update every second
+            except Exception as e:
+                print(f"Error in price update loop: {e}")
+                await asyncio.sleep(5)  # Wait before retrying
+                continue
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception as e:
@@ -246,6 +278,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.on_event("startup")
 async def startup_event():
+    logger.info("Starting up BallStreet API")
     asyncio.create_task(update_market_prices())
 
 async def update_market_prices():
@@ -387,3 +420,7 @@ def get_market_insights(db: Session = Depends(get_db)):
         "top_opportunities": insights[:5],
         "market_sentiment": sum(i['sentiment_score'] for i in insights) / len(insights)
     }
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down BallStreet API")
