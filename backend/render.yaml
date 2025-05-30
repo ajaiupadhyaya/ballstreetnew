@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ballstreet-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: cd backend && gunicorn app.main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
+    envVars:
+      - key: DATABASE_URL
+        value: postgresql://postgres:postgres@db:5432/ballstreet
+      - key: REDIS_URL
+        value: redis://redis:6379 
